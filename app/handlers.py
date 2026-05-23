@@ -21,6 +21,31 @@ from .ai import AI, ChatTurn
 from .pdf_gen import render_document_pdf, render_flyer_pdf, safe_filename
 from .storage import Storage
 
+# Max attachment size we'll process (Gemini accepts up to 20 MB inline).
+MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
+
+# Keywords in the caption that signal "clone this PDF's style" intent.
+_CLONE_KEYWORDS = (
+    "такой же",
+    "такую же",
+    "такое же",
+    "похож",
+    "переделай",
+    "клон",
+    "в том же стиле",
+    "в таком же стиле",
+    "флаер",
+    "постер",
+    "макет",
+    "сделай так",
+    "сделай мне так",
+    "make me",
+    "make one",
+    "clone",
+    "same style",
+    "like this",
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -30,8 +55,9 @@ WELCOME_TEXT = textwrap.dedent(
 
     Что я умею:
     • *Чат* — просто напиши любой вопрос, отвечу как Claude/ChatGPT
+    • *Пришли PDF или фото* с подписью — разберу и отвечу. Если в подписи "сделай такой же флаер" — переделаю под твою задачу
     • */pdf <тема>* — соберу красивый PDF документ
-    • */flyer <описание>* — сделаю флаер/постер в PDF (для печати, для клиентов)
+    • */flyer <описание>* — сделаю флаер/постер в PDF
     • */image <описание>* — сгенерирую картинку
     • */reset* — очистить историю разговора
     • */help* — снова показать эту справку
@@ -98,6 +124,19 @@ async def reset_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def _send_reply(update: Update, reply: str) -> None:
+    """Send a long reply, chunked + with Markdown fallback to plain text."""
+    if update.effective_message is None:
+        return
+    for chunk in _chunk(reply, 4000):
+        try:
+            await update.effective_message.reply_text(
+                chunk, parse_mode=ParseMode.MARKDOWN
+            )
+        except Exception:
+            await update.effective_message.reply_text(chunk)
+
+
 async def chat_msg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_message is None or update.effective_chat is None:
         return
@@ -122,16 +161,176 @@ async def chat_msg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     history.add("user", text)
     history.add("model", reply)
     storage.commit()
+    await _send_reply(update, reply)
 
-    # Telegram has a 4096 char limit per message — chunk if needed.
-    for chunk in _chunk(reply, 4000):
+
+async def _download_attachment(
+    file_id: str, context: ContextTypes.DEFAULT_TYPE
+) -> bytes:
+    file = await context.bot.get_file(file_id)
+    buf = io.BytesIO()
+    await file.download_to_memory(out=buf)
+    return buf.getvalue()
+
+
+def _wants_clone(caption: str) -> bool:
+    lower = caption.lower()
+    return any(kw in lower for kw in _CLONE_KEYWORDS)
+
+
+async def document_msg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle uploaded PDFs (and other documents).
+
+    Two modes:
+
+    * Caption clearly asks for a similar/clone flyer → use the PDF as a style
+      sample and generate a new self-contained HTML → render PDF and send back.
+    * Otherwise → attach the PDF to the chat history and answer the caption
+      as a normal question ("summarise this", "translate page 2", etc.).
+    """
+    if update.effective_message is None or update.effective_chat is None:
+        return
+    document = update.effective_message.document
+    if document is None:
+        return
+
+    mime = (document.mime_type or "").lower()
+    if not mime.startswith("application/pdf") and not mime.startswith("image/"):
+        await update.effective_message.reply_text(
+            "Пока понимаю только PDF и картинки. Кинь PDF или фото с подписью что с "
+            "ним сделать."
+        )
+        return
+
+    if document.file_size and document.file_size > MAX_ATTACHMENT_BYTES:
+        await update.effective_message.reply_text(
+            "Файл слишком большой — до 20 МБ, пожалуйста."
+        )
+        return
+
+    caption = (update.effective_message.caption or "").strip()
+
+    await _typing(update, context)
+    try:
+        data = await _download_attachment(document.file_id, context)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("download_attachment failed")
+        await update.effective_message.reply_text(
+            f"Не смог скачать файл: {exc}"
+        )
+        return
+
+    is_pdf = mime.startswith("application/pdf")
+
+    if is_pdf and _wants_clone(caption):
+        await _upload_doc(update, context)
         try:
+            html = await _ai(context).clone_flyer_html_from_pdf(data, caption)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("clone_flyer_html_from_pdf failed")
             await update.effective_message.reply_text(
-                chunk, parse_mode=ParseMode.MARKDOWN
+                f"Не получилось разобрать образец: {exc}"
             )
-        except Exception:
-            # Fall back to plain text if Markdown parsing fails.
-            await update.effective_message.reply_text(chunk)
+            return
+        try:
+            pdf_bytes = await asyncio.to_thread(render_flyer_pdf, html)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("render_flyer_pdf failed (clone)")
+            await update.effective_message.reply_text(
+                f"Не получилось собрать PDF: {exc}"
+            )
+            return
+        filename = safe_filename(caption or "flyer", fallback="flyer")
+        await update.effective_message.reply_document(
+            document=io.BytesIO(pdf_bytes),
+            filename=filename,
+            caption="Готовый флаер в стиле твоего образца",
+        )
+        return
+
+    # Default: chat mode with attachment as context.
+    storage = _storage(context)
+    history = storage.get(update.effective_chat.id)
+    turns = [ChatTurn(role=m["role"], text=m["text"]) for m in history.messages]
+    question = caption or (
+        "Кратко суммаризируй этот файл и скажи что в нём важного."
+        if is_pdf
+        else "Опиши что на этом фото."
+    )
+
+    try:
+        reply = await _ai(context).chat_reply(
+            turns,
+            question,
+            attachment_data=data,
+            attachment_mime=mime,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("chat_reply with attachment failed")
+        await update.effective_message.reply_text(
+            f"Не получилось разобрать файл: {exc}"
+        )
+        return
+
+    # Don't store the binary in history (we don't re-send it on every turn),
+    # only the textual context that we wrote on behalf of the user.
+    history.add("user", f"[прикреплён {mime}] {question}")
+    history.add("model", reply)
+    storage.commit()
+    await _send_reply(update, reply)
+
+
+async def photo_msg(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle plain photos (compressed by Telegram, sent as ``photo``)."""
+    if update.effective_message is None or update.effective_chat is None:
+        return
+    photos = update.effective_message.photo or []
+    if not photos:
+        return
+    # Largest size is last.
+    photo = photos[-1]
+
+    if photo.file_size and photo.file_size > MAX_ATTACHMENT_BYTES:
+        await update.effective_message.reply_text(
+            "Фото слишком большое — до 20 МБ, пожалуйста."
+        )
+        return
+
+    caption = (update.effective_message.caption or "").strip()
+    question = caption or "Опиши что на этом фото и что полезного я могу из этого вынести."
+
+    await _typing(update, context)
+    try:
+        data = await _download_attachment(photo.file_id, context)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("download photo failed")
+        await update.effective_message.reply_text(
+            f"Не смог скачать фото: {exc}"
+        )
+        return
+
+    storage = _storage(context)
+    history = storage.get(update.effective_chat.id)
+    turns = [ChatTurn(role=m["role"], text=m["text"]) for m in history.messages]
+
+    try:
+        reply = await _ai(context).chat_reply(
+            turns,
+            question,
+            attachment_data=data,
+            attachment_mime="image/jpeg",
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("chat_reply with photo failed")
+        await update.effective_message.reply_text(
+            f"Не получилось разобрать фото: {exc}"
+        )
+        return
+
+    history.add("user", f"[картинка] {question}")
+    history.add("model", reply)
+    storage.commit()
+    await _send_reply(update, reply)
 
 
 async def pdf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -285,6 +484,8 @@ def register(application: Application, ai: AI, storage: Storage) -> None:
     application.add_handler(CommandHandler("pdf", pdf_cmd))
     application.add_handler(CommandHandler("flyer", flyer_cmd))
     application.add_handler(CommandHandler("image", image_cmd))
+    application.add_handler(MessageHandler(filters.Document.ALL, document_msg))
+    application.add_handler(MessageHandler(filters.PHOTO, photo_msg))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, chat_msg))
 
     application.add_error_handler(error_handler)
