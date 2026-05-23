@@ -1,0 +1,32 @@
+# Render Blueprint — defines the deployment of the VPKN bot.
+# https://render.com/docs/blueprint-spec
+#
+# Usage:
+#   1. Connect this repo to Render.
+#   2. Render will detect this file and prompt you to "Apply" the blueprint.
+#   3. It will create a web service running the Docker image from this repo.
+#   4. Set the two required secret env vars (TELEGRAM_BOT_TOKEN, GEMINI_API_KEY)
+#      in the Render dashboard.
+services:
+  - type: web
+    name: vpkn-bot
+    runtime: docker
+    plan: free
+    region: frankfurt
+    autoDeploy: true
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false  # set manually in dashboard after first deploy
+      - key: GEMINI_API_KEY
+        sync: false  # set manually in dashboard after first deploy
+      - key: GEMINI_MODEL
+        value: gemini-flash-latest
+      - key: GEMINI_IMAGE_MODEL
+        value: gemini-2.5-flash-image
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: LOG_LEVEL
+        value: INFO
+      - key: DATA_DIR
+        value: /tmp/bot_data
