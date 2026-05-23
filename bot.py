@@ -55,12 +55,22 @@ def main() -> None:
         url_path = f"telegram/{webhook_secret}"
         webhook_url = f"{config.webhook_base_url}/{url_path}"
         logging.info("Starting webhook at %s (port %s)", webhook_url, config.port)
+        # The Telegram Bot API allows A-Z, a-z, 0-9, '_', and '-' in the
+        # X-Telegram-Bot-Api-Secret-Token header value.
+        token_chars = set(
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+        )
+        secret_token = (
+            webhook_secret
+            if webhook_secret and all(c in token_chars for c in webhook_secret)
+            else None
+        )
         application.run_webhook(
             listen="0.0.0.0",
             port=config.port,
             url_path=url_path,
             webhook_url=webhook_url,
-            secret_token=webhook_secret if webhook_secret.isalnum() else None,
+            secret_token=secret_token,
             allowed_updates=None,
         )
     else:
