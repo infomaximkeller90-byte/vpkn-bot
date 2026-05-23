@@ -1,0 +1,1 @@
+"""VPKN assistant bot package."""
