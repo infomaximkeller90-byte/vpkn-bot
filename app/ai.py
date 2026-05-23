@@ -1,12 +1,15 @@
 """Thin wrapper around the Google Gemini API.
 
-Exposes three high-level helpers used by the rest of the bot:
+Exposes the high-level helpers used by the rest of the bot:
 
-- ``chat_reply`` — chat completion with conversation history.
+- ``chat_reply`` — chat completion with conversation history; optional
+  attachment (image / PDF) for vision and document analysis.
 - ``generate_document`` — produce a structured JSON document spec from a
   natural language prompt (used by the PDF generator).
 - ``generate_flyer_html`` — produce a self-contained HTML+CSS flyer from a
   natural language prompt (used by the flyer generator).
+- ``clone_flyer_html_from_pdf`` — take an uploaded PDF + caption, produce a
+  new self-contained HTML+CSS flyer that mimics the original style.
 - ``generate_image`` — image generation via Gemini image models.
 """
 from __future__ import annotations
@@ -30,9 +33,30 @@ CHAT_SYSTEM_PROMPT = (
     "пользователя (по умолчанию русский). Будь полезным, кратким и точным. "
     "Используй Markdown для форматирования (жирный, курсив, списки, ссылки), "
     "Telegram отрендерит его. Не используй слишком много эмодзи. "
+    "Пользователь может присылать картинки и PDF-файлы — разбирай их и "
+    "отвечай по содержанию. "
     "Если пользователь хочет сгенерировать PDF документ — подскажи команду "
     "/pdf <описание>. Для флаеров/постеров — /flyer <описание>. Для очистки "
     "истории разговора — /reset. Для генерации картинки — /image <описание>."
+)
+
+
+FLYER_CLONE_SYSTEM_PROMPT = (
+    "Ты — дизайнер-клонировщик. Тебе дают PDF-образец и задачу от "
+    "пользователя. Изучи стиль оригинала (композиция, цвета, типографика, "
+    "иерархия, декоративные элементы) и сгенерируй ОДИН самодостаточный HTML-"
+    "файл (включая <style>) под задачу пользователя в том же визуальном "
+    "языке. Только HTML, без пояснений и без markdown-блоков ```. Требования:\n"
+    "- @page { size: A4; margin: 0; } и body без margin, чтобы заполнить лист\n"
+    "- Сохрани стиль, цвета и композицию оригинала, но весь текст/"
+    "  данные подмени под задачу пользователя\n"
+    "- Только системные/веб-безопасные шрифты (sans-serif, serif). НЕ подключай "
+    "  Google Fonts\n"
+    "- НЕ используй внешние картинки или ссылки. Все декоративные элементы делай "
+    "  через CSS/SVG inline\n"
+    "- Если в оригинале были фото/логотипы — замени их на похожие по духу "
+    "  SVG-иллюстрации (не пытайся вставить реальное фото)\n"
+    "- Подходит для печати на A4 или отправки клиенту"
 )
 
 # JSON schema describing the structured PDF "document spec" that
@@ -129,15 +153,29 @@ class AI:
         self.chat_model = chat_model
         self.image_model = image_model
 
-    async def chat_reply(self, history: List[ChatTurn], user_text: str) -> str:
-        """Generate a chat reply, given prior history + the new user turn."""
+    async def chat_reply(
+        self,
+        history: List[ChatTurn],
+        user_text: str,
+        attachment_data: Optional[bytes] = None,
+        attachment_mime: Optional[str] = None,
+    ) -> str:
+        """Generate a chat reply, given prior history + the new user turn.
+
+        ``attachment_data`` / ``attachment_mime`` let the user attach a single
+        binary (image or PDF) to the current turn. The attachment is sent as
+        an additional Part on the user turn so Gemini can reason about it.
+        """
         contents = _history_to_contents(history)
-        contents.append(
-            types.Content(
-                role="user",
-                parts=[types.Part.from_text(text=user_text)],
+        user_parts: List[types.Part] = []
+        if attachment_data and attachment_mime:
+            user_parts.append(
+                types.Part.from_bytes(
+                    data=attachment_data, mime_type=attachment_mime
+                )
             )
-        )
+        user_parts.append(types.Part.from_text(text=user_text))
+        contents.append(types.Content(role="user", parts=user_parts))
 
         def _run() -> str:
             response = self._client.models.generate_content(
@@ -150,6 +188,46 @@ class AI:
                 ),
             )
             return (response.text or "").strip() or "(пустой ответ)"
+
+        return await asyncio.to_thread(_run)
+
+    async def clone_flyer_html_from_pdf(
+        self, pdf_bytes: bytes, user_caption: str
+    ) -> str:
+        """Given a PDF sample and a free-form caption, return new flyer HTML.
+
+        The model is shown the PDF in-line and asked to mimic its visual
+        language while substituting the content for what the user described
+        in their caption.
+        """
+        caption = (user_caption or "").strip() or (
+            "Сделай в том же стиле, без конкретных правок — выбери схожую тему."
+        )
+        parts = [
+            types.Part.from_bytes(data=pdf_bytes, mime_type="application/pdf"),
+            types.Part.from_text(
+                text=(
+                    "Приложен образец в PDF. Сделай похожий флаер/постер "
+                    "по задаче:\n\n" + caption
+                )
+            ),
+        ]
+
+        def _run() -> str:
+            response = self._client.models.generate_content(
+                model=self.chat_model,
+                contents=[types.Content(role="user", parts=parts)],
+                config=types.GenerateContentConfig(
+                    system_instruction=FLYER_CLONE_SYSTEM_PROMPT,
+                    temperature=0.7,
+                    max_output_tokens=8192,
+                ),
+            )
+            raw = (response.text or "").strip()
+            if raw.startswith("```"):
+                raw = re.sub(r"^```[a-zA-Z]*\n?", "", raw)
+                raw = re.sub(r"\n?```\s*$", "", raw)
+            return raw.strip()
 
         return await asyncio.to_thread(_run)
 
